@@ -1,0 +1,23 @@
+# Python virtual environment
+venv/
+/venv/
+
+# PyInstaller build artifacts
+/dist/
+/build/
+*.spec
+
+# Application-generated data (IMPORTANT)
+/images/
+*.db
+*.db-journal
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE / Editor specific files (optional but good practice)
+.vscode/
+.idea/

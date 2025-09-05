@@ -8,8 +8,17 @@ import io
 import os
 import threading
 import textwrap
+import sys
 
-# --- Configuration & Setup (No Changes) ---
+# --- Portable Path Configuration ---
+if getattr(sys, 'frozen', False):
+    BASE_PATH = os.path.dirname(sys.executable)
+else:
+    BASE_PATH = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_PATH, "anime.db")
+CACHE_PATH = os.path.join(BASE_PATH, "images")
+
+# --- API Configuration and other setup (No Changes) ---
 ANILIST_API_URL = 'https://graphql.anilist.co'
 ANILIST_SEARCH_QUERY = '''
 query ($search: String) {
@@ -77,9 +86,9 @@ api_results = []
 search_panel_last_width = 350
 sash_width = 6
 def get_image_path(anime_id):
-    return os.path.join("images", f"{anime_id}.png")
+    return os.path.join(CACHE_PATH, f"{str(anime_id)}.png")
 def save_image_from_url(url, anime_id):
-    if not os.path.exists("images"): os.makedirs("images")
+    if not os.path.exists(CACHE_PATH): os.makedirs(CACHE_PATH)
     try:
         response = requests.get(url, stream=True)
         if response.status_code == 200:
@@ -90,7 +99,7 @@ def save_image_from_url(url, anime_id):
         print(f"Failed to save image from URL: {e}")
     return False
 def setup_database():
-    conn = sqlite3.connect('anime.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''
         CREATE TABLE IF NOT EXISTS anime (
@@ -112,14 +121,14 @@ def setup_database():
     conn.commit()
     conn.close()
 def add_anime_to_db(anime_id, title, episodes, image_url, initial_progress=0, initial_status="Watching"):
-    conn = sqlite3.connect('anime.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("INSERT OR REPLACE INTO anime (id, title, progress, episodes, status, image_url) VALUES (?, ?, ?, ?, ?, ?)",
               (str(anime_id), title, initial_progress, episodes, initial_status, image_url))
     conn.commit()
     conn.close()
 def get_all_anime(search_query="", status_filter="All"):
-    conn = sqlite3.connect('anime.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     sql_query = "SELECT id, title, progress, status, episodes, image_url FROM anime WHERE title LIKE ?"
     params = ('%' + search_query + '%',)
@@ -131,30 +140,32 @@ def get_all_anime(search_query="", status_filter="All"):
     conn.close()
     return anime_data
 def get_anime_data(anime_id):
-    conn = sqlite3.connect('anime.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT title, progress, status, episodes, image_url FROM anime WHERE id = ?", (str(anime_id),))
     data = c.fetchone()
     conn.close()
     return data
 def update_anime_progress(anime_id, new_progress):
-    conn = sqlite3.connect('anime.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("UPDATE anime SET progress = ? WHERE id = ?", (new_progress, str(anime_id)))
     conn.commit()
     conn.close()
 def update_anime_status(anime_id, new_status):
-    conn = sqlite3.connect('anime.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("UPDATE anime SET status = ? WHERE id = ?", (new_status, str(anime_id)))
     conn.commit()
     conn.close()
 def delete_anime_from_db(anime_id):
-    conn = sqlite3.connect('anime.db')
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("DELETE FROM anime WHERE id = ?", (str(anime_id),))
     conn.commit()
     conn.close()
+
+# --- UI Functions ---
 def display_main_anime_grid(event=None):
     if my_list_panel.winfo_width() > 1:
         for widget in my_list_frame_content.winfo_children(): widget.destroy()
@@ -190,45 +201,69 @@ def display_main_anime_grid(event=None):
             card_frame.bind("<Button-1>", lambda event, id=anime_id: open_details_window(id, is_new_anime=False))
             for child in card_frame.winfo_children():
                 if child is not status_indicator: child.bind("<Button-1>", lambda event, id=anime_id: open_details_window(id, is_new_anime=False))
+
+# MODIFIED: Search results grid now handles the "No results" case properly
+def display_search_results_grid():
+    for widget in search_results_frame.winfo_children():
+        widget.destroy()
+    
+    if not api_results:
+        customtkinter.CTkLabel(search_results_frame, text="No results found.").pack(pady=20)
+        return
+
+    panel_width = search_results_frame.winfo_width()
+    card_width = 120 + 20
+    num_columns = max(1, panel_width // card_width)
+
+    for i, anime in enumerate(api_results):
+        row = i // num_columns
+        col = i % num_columns
+        
+        card_frame = customtkinter.CTkFrame(search_results_frame, width=120, height=200)
+        card_frame.grid(row=row, column=col, padx=10, pady=10, sticky="nw")
+        
+        image_url = anime['coverImage']['large']
+        placeholder = customtkinter.CTkLabel(card_frame, text="Loading...", width=100, height=150)
+        placeholder.pack(pady=(5,0))
+        
+        threading.Thread(target=load_image_and_display_search, args=(card_frame, image_url, anime['title']['romaji'], i, placeholder), daemon=True).start()
+
+# MODIFIED: search_anime now correctly schedules the UI update on the main thread
 def search_anime(event=None):
     global api_results
     api_results = []
+    # Clear the grid immediately for responsiveness
     for widget in search_results_frame.winfo_children(): widget.destroy()
     search_query = search_entry_add.get().strip()
     if not search_query: return
     loading_label = customtkinter.CTkLabel(search_results_frame, text="Searching...", font=("Arial", 12))
     loading_label.pack(pady=20)
     root.update_idletasks()
+    
     def do_search():
+        nonlocal loading_label
         try:
             variables = {'search': search_query}
             response = requests.post(ANILIST_API_URL, json={'query': ANILIST_SEARCH_QUERY, 'variables': variables})
-            loading_label.destroy()
+            
             if response.status_code == 200:
                 data = response.json()
-                results = data['data']['Page']['media']
-                if not results:
-                    customtkinter.CTkLabel(search_results_frame, text="No results found.").pack(pady=10)
-                    return
-                panel_width = search_results_frame.winfo_width()
-                card_width = 120 + 20
-                num_columns = max(1, panel_width // card_width)
-                for i, anime in enumerate(results):
-                    api_results.append(anime)
-                    row = i // num_columns
-                    col = i % num_columns
-                    card_frame = customtkinter.CTkFrame(search_results_frame, width=120, height=200)
-                    card_frame.grid(row=row, column=col, padx=10, pady=10, sticky="nw")
-                    image_url = anime['coverImage']['large']
-                    placeholder = customtkinter.CTkLabel(card_frame, text="Loading...", width=100, height=150)
-                    placeholder.pack(pady=(5,0))
-                    threading.Thread(target=load_image_and_display_search, args=(card_frame, image_url, anime['title']['romaji'], len(api_results)-1, placeholder), daemon=True).start()
+                global api_results
+                api_results = data['data']['Page']['media']
+                # FIX: Schedule the grid display on the main thread
+                root.after(0, display_search_results_grid)
             else:
-                customtkinter.CTkLabel(search_results_frame, text="Error fetching results.").pack(pady=10)
+                root.after(0, lambda: customtkinter.CTkLabel(search_results_frame, text="Error fetching results.").pack(pady=10))
+
         except requests.exceptions.RequestException:
-            loading_label.destroy()
-            customtkinter.CTkLabel(search_results_frame, text="Network Error.").pack(pady=10)
+            root.after(0, lambda: customtkinter.CTkLabel(search_results_frame, text="Network Error.").pack(pady=10))
+        finally:
+            # Make sure the loading label is always removed on the main thread
+            root.after(0, loading_label.destroy)
+
     threading.Thread(target=do_search, daemon=True).start()
+
+# ... (The rest of the file is unchanged) ...
 def load_image_and_display_search(parent_frame, image_url, title, index, placeholder_widget):
     try:
         image_response = requests.get(image_url)
@@ -422,12 +457,10 @@ def toggle_search_panel():
         search_panel.configure(width=search_panel_last_width)
         toggle_button.configure(text="◀")
         update_button_position(search_panel_last_width)
-    root.after(50, display_main_anime_grid)
-
-# --- UI Setup ---
+    root.after(50, display_search_results_grid)
 customtkinter.set_appearance_mode("Dark")
 root = customtkinter.CTk()
-root.title("My Anime Tracker")
+root.title("Fetish Tracker")
 root.state('zoomed')
 main_content_frame = customtkinter.CTkFrame(root, corner_radius=0, fg_color="transparent")
 main_content_frame.pack(fill="both", expand=True)
@@ -447,57 +480,41 @@ class Sash(customtkinter.CTkFrame):
             self.target.configure(width=new_width)
             search_panel_last_width = new_width
             update_button_position(new_width)
-    def on_release(self, event): display_main_anime_grid()
+    def on_release(self, event):
+        display_main_anime_grid()
+        display_search_results_grid()
 sash = Sash(main_content_frame, search_panel)
 sash.pack(side="left", fill="y")
 toggle_button = customtkinter.CTkButton(main_content_frame, text="◀", command=toggle_search_panel, width=20, height=40, corner_radius=8, fg_color="transparent", text_color="white", anchor="center")
 update_button_position(search_panel_last_width)
 my_list_panel = customtkinter.CTkFrame(main_content_frame, corner_radius=0, fg_color="transparent")
 my_list_panel.pack(side="left", fill="both", expand=True)
-
-# --- MODIFIED: Filter Section ---
 my_list_filter_frame = customtkinter.CTkFrame(my_list_panel, fg_color="transparent")
 my_list_filter_frame.pack(pady=10, padx=10, fill="x")
-
 customtkinter.CTkLabel(my_list_filter_frame, text="Search My List:").pack(side=tk.LEFT, padx=(0, 5))
 my_list_search_entry = customtkinter.CTkEntry(my_list_filter_frame, width=200)
 my_list_search_entry.pack(side=tk.LEFT, padx=(0, 20))
 my_list_search_entry.bind('<KeyRelease>', display_main_anime_grid)
-
 my_list_status_var = customtkinter.StringVar(value="All")
 status_options = ["All", "Watching", "Completed", "Plan to Watch", "On Hold", "Dropped"]
 status_buttons = {}
-
 def filter_by_status(status):
     my_list_status_var.set(status)
     display_main_anime_grid()
-    # Update button appearance to show active state
     for s, btn in status_buttons.items():
         if s == status:
             btn.configure(border_width=2)
         else:
             btn.configure(border_width=0)
-
 status_button_frame = customtkinter.CTkFrame(my_list_filter_frame, fg_color="transparent")
 status_button_frame.pack(side=tk.LEFT, padx=10)
-
 for status in status_options:
-    color = STATUS_COLORS.get(status, "#565b5e") # Default customtkinter button color for "All"
-    
-    button = customtkinter.CTkButton(status_button_frame, text=status,
-                                     fg_color=color,
-                                     border_color="#00AFFF", # A bright blue to indicate selection
-                                     border_width=0, # Initially not selected
-                                     command=lambda s=status: filter_by_status(s))
+    color = STATUS_COLORS.get(status, "#565b5e")
+    button = customtkinter.CTkButton(status_button_frame, text=status, fg_color=color, border_color="#00AFFF", border_width=0, command=lambda s=status: filter_by_status(s))
     button.pack(side=tk.LEFT, padx=4)
     status_buttons[status] = button
-
-# --- END MODIFIED Filter Section ---
-
 my_list_frame_content = customtkinter.CTkScrollableFrame(my_list_panel, fg_color="transparent")
 my_list_frame_content.pack(pady=10, padx=10, fill="both", expand=True)
-
-# --- Initial setup ---
 search_bix_frame = customtkinter.CTkFrame(search_panel, fg_color="transparent")
 search_bix_frame.pack(pady=10, padx=10, fill="x")
 customtkinter.CTkLabel(search_bix_frame, text="Search Anime").pack(anchor="w")
@@ -508,8 +525,6 @@ search_button = customtkinter.CTkButton(search_bix_frame, text="Search", command
 search_button.pack()
 search_results_frame = customtkinter.CTkScrollableFrame(search_panel, fg_color="gray17")
 search_results_frame.pack(pady=10, padx=10, fill="both", expand=True)
-
 setup_database()
-filter_by_status("All") # Set the initial filter to "All" and highlight the button
-root.after(100, display_main_anime_grid)
+root.after(150, lambda: filter_by_status("All"))
 root.mainloop()
